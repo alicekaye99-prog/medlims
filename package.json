@@ -7,15 +7,14 @@
     "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
     "build": "vite build",
     "electron": "electron .",
-    "obfuscate": "npx javascript-obfuscator dist/assets --output dist/assets --compact true --string-array true --self-defending true --dead-code-injection false",
-    "dist:win7-x86": "npm run build && npm run obfuscate && electron-builder --config electron-builder-win7.json --win --ia32",
-    "dist:win10-x86": "npm run build && npm run obfuscate && electron-builder --config electron-builder-win10.json --win --ia32",
-    "dist:win10-x64": "npm run build && npm run obfuscate && electron-builder --config electron-builder-win10.json --win --x64",
-    "dist:win10-both": "npm run build && npm run obfuscate && electron-builder --config electron-builder-win10.json --win --ia32 --x64"
+    "obfuscate": "echo 'Skipping obfuscation'",
+    "dist:win10-x64": "npm run build && npx electron-builder --win zip --x64 -c.directories.output=release/win10"
   },
   "author": "Bryce Men Kenk C. Ablir, RMT",
   "license": "ISC",
   "dependencies": {
+    "better-sqlite3": "^13.0.2",
+    "dexie": "^4.4.4",
     "jspdf": "^2.5.1",
     "jspdf-autotable": "^3.8.2",
     "react": "^18.2.0",
