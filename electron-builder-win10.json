@@ -1,19 +1,35 @@
 {
   "appId": "com.medlims.app",
   "productName": "MedLIMS",
-  "copyright": "XIII Vibetech",
+  "copyright": "Bryce Men Kenk C. Ablir, RMT",
   "directories": {
-    "output": "release/win10"
+    "output": "release"
   },
   "files": [
     "dist/**/*",
     "electron/**/*",
-    "icons/**/*",
-    "package.json"
+    "icons/**/*"
   ],
+  "electronVersion": "22.3.27",
   "win": {
-    "publisherName": "XIII Vibetech",
-    "target": "zip",
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      }
+    ],
     "icon": "icons/icon.ico"
+  },
+  "nsis": {
+    "oneClick": true,
+    "allowToChangeInstallationDirectory": false,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "MedLIMS",
+    "uninstallDisplayName": "MedLIMS",
+    "installerIcon": "icons/icon.ico",
+    "uninstallerIcon": "icons/icon.ico",
+    "installerHeader": "icons/icon.ico",
+    "artifactName": "MedLIMS-Setup-Win10-x64.exe"
   }
 }

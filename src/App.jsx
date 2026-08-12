@@ -1,11 +1,25 @@
-import { useState, useEffect } from "react";
-import { SECTIONS, DEFAULT_TESTS, dbLoad, dbSave, loadLicense, verifyLicenseSig, licenseStatus } from "./constants/data.js";
-import { C, toInputDate, dbLoadChunked, dbSaveChunked, uid } from "./utils/helpers.jsx";
-import { downloadResultAsPDF } from "./utils/pdfGenerator.js";
+import React, { useState, useEffect, startTransition } from "react";
+import { SECTIONS, DEFAULT_TESTS, loadLicense, verifyLicenseSig, licenseStatus, SHEET_ID, WEBHOOK_URL } from "./constants/data.js";
+import { C, Btn, toInputDate, uid } from "./utils/helpers.jsx";
+import {
+  initDatabase,
+  dbSavePatients,
+  dbSaveResults,
+  dbSaveSingleResult,
+  dbDeleteResult,
+  dbSaveStaff,
+  dbSaveTests,
+  dbSaveHospital,
+  dbSaveAccounts,
+  dbSaveDraft,
+  dbDeleteDraft
+} from "./utils/db.js";
+import { downloadResultAsPDF, generateResultPDFDataUri } from "./utils/pdfGenerator.js";
 import { Icon } from "./components/common/Icons.jsx";
 
 import { SerialKeyGate, LicenseExpiredGate } from "./components/gates/SerialKeyGate.jsx";
 import { SwitchProfileModal } from "./components/common/SwitchProfileModal.jsx";
+import { PDFPreviewModal } from "./components/common/PDFPreviewModal.jsx";
 import { DashboardView } from "./components/views/DashboardView.jsx";
 import { LabEntry } from "./components/views/LabEntry.jsx";
 import { SummaryView } from "./components/views/SummaryView.jsx";
@@ -21,9 +35,51 @@ import { TemplatesView } from "./components/views/TemplatesView.jsx";
 import { BarcodeView } from "./components/views/BarcodeView.jsx";
 
 export default function App() {
-  const [licState, setLicState] = useState("loading");
+  const [licState, setLicState] = useState("checking");
   const [licData, setLicData] = useState(null);
   const [showKeyEntry, setShowKeyEntry] = useState(false);
+
+  const recheckSheet = async (lic) => {
+    if (!lic || !lic.keyHash || !SHEET_ID) return "ok";
+    try {
+      const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timer);
+
+      const text = await res.text();
+      const json = JSON.parse(text.slice(47, -2));
+      const rows = json?.table?.rows || [];
+
+      for (const row of rows) {
+        const rowHash = (row.c[0]?.v || "").trim();
+        if (rowHash !== lic.keyHash) continue;
+
+        const rowStatus = (row.c[3]?.v || "").toLowerCase().trim();
+        const rowExpiry = row.c[6]?.v || "";
+
+        if (["revoked", "banned", "disabled", "expired"].includes(rowStatus)) return rowStatus;
+
+        if (rowExpiry) {
+          const expDate = new Date(rowExpiry);
+          if (!isNaN(expDate.getTime()) && Date.now() > expDate.getTime()) return "expired";
+        }
+        return "ok";
+      }
+      return "ok";
+    } catch (e) {
+      return "ok";
+    }
+  };
+
+  const sendToSheet = async (keyHash, deviceId, expiresAt) => {
+    if (!WEBHOOK_URL) return;
+    try {
+      const body = new URLSearchParams({ keyHash, deviceId, expiresAt });
+      await fetch(WEBHOOK_URL, { method: "POST", body });
+    } catch (e) {}
+  };
 
   useEffect(() => {
     async function checkSavedLicense() {
@@ -33,25 +89,62 @@ export default function App() {
         setShowKeyEntry(true);
         return;
       }
+
       const isSigValid = await verifyLicenseSig(savedLic);
       if (!isSigValid) {
+        localStorage.removeItem("medlims_license");
         setLicState("none");
         setShowKeyEntry(true);
         return;
       }
-      const status = licenseStatus(savedLic);
+
+      const localStatus = licenseStatus(savedLic);
+      if (localStatus === "expired") {
+        setLicData(savedLic);
+        setLicState("expired");
+        return;
+      }
+
       setLicData(savedLic);
-      setLicState(status);
-      if (status === "valid") {
-        setShowKeyEntry(false);
-      } else if (status === "expired") {
-        setShowKeyEntry(false);
-      } else {
-        setShowKeyEntry(true);
+      setLicState("valid");
+      setShowKeyEntry(false);
+
+      recheckSheet(savedLic).then((sheetStatus) => {
+        if (["revoked", "banned", "disabled"].includes(sheetStatus)) {
+          localStorage.removeItem("medlims_license");
+          setLicState("none");
+          setShowKeyEntry(true);
+        } else if (sheetStatus === "expired") {
+          setLicState("expired");
+        }
+      });
+
+      if (savedLic.keyHash && savedLic.deviceId) {
+        const expiresAtStr = savedLic.expiresAt && savedLic.expiresAt !== "lifetime"
+          ? new Date(savedLic.expiresAt).toISOString().slice(0, 10)
+          : "lifetime";
+        sendToSheet(savedLic.keyHash, savedLic.deviceId, expiresAtStr);
       }
     }
+
     checkSavedLicense();
   }, []);
+
+  useEffect(() => {
+    if (licState !== "valid" || !licData) return;
+    const interval = setInterval(async () => {
+      const sheetStatus = await recheckSheet(licData);
+      if (["revoked", "banned", "disabled"].includes(sheetStatus)) {
+        localStorage.removeItem("medlims_license");
+        setLicState("none");
+        setShowKeyEntry(true);
+      } else if (sheetStatus === "expired") {
+        setLicState("expired");
+      }
+    }, 30 * 60 * 1000);
+
+    return () => clearInterval(interval);
+  }, [licState, licData]);
 
   const handleActivated = () => {
     const savedLic = loadLicense();
@@ -60,9 +153,9 @@ export default function App() {
     setShowKeyEntry(false);
   };
 
-  if (licState === "loading") {
+  if (licState === "checking") {
     return (
-      <div style={{ minHeight: "100vh", background: "#0F2D52", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Inter', sans-serif", fontSize: 14 }}>
+      <div style={{ minHeight: "100vh", background: "#0d213a", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Inter', sans-serif", fontSize: 14 }}>
         Verifying License…
       </div>
     );
@@ -85,83 +178,178 @@ function AppMain({ licData }) {
   const [patients, setPatients] = useState([]);
   const [staff, setStaff] = useState([]);
   const [results, setResults] = useState([]);
+  const [drafts, setDrafts] = useState([]);
+  const [preDraft, setPreDraft] = useState(null);
   const [tests, setTests] = useState(null);
-  const [hospital, setHospital] = useState({ name: "", address: "", phone: "", setupDone: false });
+  const [hospital, setHospital] = useState({ name: "BAIS DISTRICT HOSPITAL", address: "", phone: "", setupDone: false });
   const [accounts, setAccounts] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
   const [switchModal, setSwitchModal] = useState(false);
   const [loaded, setLoaded] = useState(false);
-  const [printQ, setPrintQ] = useState([]);
   const [crossSectionPatientId, setCrossSectionPatientId] = useState("");
 
-  // Declared BEFORE useEffect dependencies
+  const [previewPdfObj, setPreviewPdfObj] = useState(null);
+
+  const [printQ, setPrintQ] = useState([]);
+  const [batchTotal, setBatchTotal] = useState(0);
+  const [batchDone, setBatchDone] = useState(0);
+  const [batchActive, setBatchActive] = useState(false);
+  const [batchCurrentName, setBatchCurrentName] = useState("");
+
   const curSection = view.startsWith("lab:") ? view.slice(4) : null;
   const secDef = curSection ? SECTIONS.find(s => s.id === curSection) : null;
 
+  const changeView = (newView) => {
+    if (document.activeElement && typeof document.activeElement.blur === "function") {
+      document.activeElement.blur();
+    }
+    startTransition(() => {
+      setView(newView);
+    });
+  };
+
   useEffect(() => {
-    setPatients(dbLoadChunked("lims_p3", []));
-    setStaff(dbLoad("lims_s3", []));
-    setResults(dbLoadChunked("lims_r3", []));
-    const savedTests = dbLoad("lims_t3", null);
-    if (savedTests) {
-      const merged = { ...savedTests };
-      Object.keys(DEFAULT_TESTS).forEach(k => {
-        if (!merged[k] || merged[k].length === 0) merged[k] = JSON.parse(JSON.stringify(DEFAULT_TESTS[k]));
-      });
-      setTests(merged);
-    } else {
-      setTests(DEFAULT_TESTS);
-    }
-    const hi = dbLoad("lims_h3", null);
-    if (hi) setHospital(hi);
-    const accs = dbLoad("lims_accounts", []);
-    if (accs.length === 0) {
+    async function loadDexieData() {
       const defaultAccounts = [{ id: uid(), username: "admin", password: "admin123", role: "Admin", name: "Administrator", createdAt: toInputDate() }];
-      setAccounts(defaultAccounts);
-      dbSave("lims_accounts", defaultAccounts);
-    } else {
-      setAccounts(accs);
+      const defaultHospital = { name: "BAIS DISTRICT HOSPITAL", address: "", phone: "", setupDone: false };
+
+      const data = await initDatabase(DEFAULT_TESTS, defaultAccounts, defaultHospital);
+      setPatients(data.patients);
+      setResults(data.results);
+      setStaff(data.staff);
+      setTests(data.tests);
+      setHospital(data.hospital);
+      setAccounts(data.accounts);
+      setDrafts(data.drafts || []);
+      setLoaded(true);
     }
-    setLoaded(true);
+
+    loadDexieData();
   }, []);
 
-  const sp = v => { setPatients(v); dbSaveChunked("lims_p3", v); };
-  const ss = v => { setStaff(v); dbSave("lims_s3", v); };
-  const sr = v => { setResults(v); dbSaveChunked("lims_r3", v); };
-  const st = v => { setTests(v); dbSave("lims_t3", v); };
-  const sh = v => { setHospital(v); dbSave("lims_h3", v); };
-  const sa = v => { setAccounts(v); dbSave("lims_accounts", v); };
+  const sp = (v) => { setPatients(v); dbSavePatients(v); };
+  const ss = (v) => { setStaff(v); dbSaveStaff(v); };
+  const sr = (v) => { setResults(v); dbSaveResults(v); };
+  const st = (v) => { setTests(v); dbSaveTests(v); };
+  const sh = (v) => { setHospital(v); dbSaveHospital(v); };
+  const sa = (v) => { setAccounts(v); dbSaveAccounts(v); };
 
-  const addResult = r => { const u = [r, ...results]; sr(u); };
-  useEffect(() => { if (crossSectionPatientId) setCrossSectionPatientId(""); }, [curSection]);
-  const delResult = id => sr(results.filter(r => r.id !== id));
-  const editResult = r => sr(results.map(x => x.id === r.id ? r : x));
+  const addResult = (r) => {
+    const updated = [r, ...results];
+    setResults(updated);
+    dbSaveSingleResult(r);
+  };
 
   useEffect(() => {
-    if (!printQ || printQ.length === 0) return;
+    if (crossSectionPatientId) setCrossSectionPatientId("");
+  }, [curSection]);
+
+  const delResult = (id) => {
+    setResults(results.filter((r) => r.id !== id));
+    dbDeleteResult(id);
+  };
+
+  const editResult = (r) => {
+    const updated = results.map((x) => (x.id === r.id ? r : x));
+    setResults(updated);
+    dbSaveSingleResult(r);
+  };
+
+  const handleSaveDraft = (draftObj) => {
+    setDrafts((prev) => {
+      const exists = prev.find((d) => d.id === draftObj.id);
+      return exists ? prev.map((d) => (d.id === draftObj.id ? draftObj : d)) : [draftObj, ...prev];
+    });
+    dbSaveDraft(draftObj);
+  };
+
+  const handleDeleteDraft = (id) => {
+    setDrafts((prev) => prev.filter((d) => d.id !== id));
+    dbDeleteDraft(id);
+  };
+
+  const handleResumeDraft = (draftObj) => {
+    setPreDraft(draftObj);
+    changeView("lab:" + draftObj.section);
+  };
+
+  const handleTriggerPrint = async (resultObj) => {
+    const pt = patients.find((p) => p.id === resultObj.patientId);
+    try {
+      const { dataUri, filename } = await generateResultPDFDataUri(resultObj, pt, hospital, staff);
+      setPreviewPdfObj({ dataUri, filename, resultObj, pt });
+    } catch (e) {
+      console.error(e);
+      downloadResultAsPDF(resultObj, pt, hospital, false, staff);
+    }
+  };
+
+  const handleConfirmPrintFromPreview = () => {
+    if (!previewPdfObj) return;
+    const { resultObj, pt } = previewPdfObj;
+    downloadResultAsPDF(resultObj, pt, hospital, false, staff).then(() => {
+      setResults((prev) => {
+        const updated = prev.map((r) => (r.id === resultObj.id ? { ...r, printed: true, printedAt: new Date().toISOString() } : r));
+        const currentUpdated = updated.find((r) => r.id === resultObj.id);
+        if (currentUpdated) dbSaveSingleResult(currentUpdated);
+        return updated;
+      });
+      setPreviewPdfObj(null);
+    });
+  };
+
+  const closeBatchOverlay = () => {
+    setBatchActive(false);
+    setBatchTotal(0);
+    setBatchDone(0);
+    setBatchCurrentName("");
+    setPrintQ([]);
+  };
+
+  useEffect(() => {
+    if (!printQ || printQ.length === 0) {
+      return;
+    }
+
     const isBatch = !!printQ._batch;
+    if (isBatch && !batchActive) {
+      setBatchTotal(printQ.length);
+      setBatchDone(0);
+      setBatchActive(true);
+    }
+
     const [next, ...rest] = printQ;
-    const pt = patients.find(p => p.id === next.patientId);
-    downloadResultAsPDF(next, pt, hospital, isBatch, staff)
+    const pt = patients.find((p) => p.id === next.patientId);
+    if (isBatch) setBatchCurrentName(pt?.name || "Patient");
+
+    downloadResultAsPDF(next, pt, hospital, staff)
       .then(() => {
-        setResults(prev => {
-          const updated = prev.map(r => r.id === next.id ? { ...r, printed: true, printedAt: new Date().toISOString() } : r);
-          dbSave("lims_r3", updated);
+        setResults((prev) => {
+          const updated = prev.map((r) => (r.id === next.id ? { ...r, printed: true, printedAt: new Date().toISOString() } : r));
+          const currentUpdated = updated.find((r) => r.id === next.id);
+          if (currentUpdated) dbSaveSingleResult(currentUpdated);
           return updated;
         });
+        if (isBatch) setBatchDone((prev) => prev + 1);
         if (rest.length > 0) {
           setTimeout(() => {
             const nextQ = [...rest];
             if (isBatch) nextQ._batch = true;
             setPrintQ(nextQ);
           }, 600);
-        } else setPrintQ([]);
+        } else {
+          setPrintQ([]);
+        }
       })
-      .catch(e => { console.error(e); setPrintQ(rest); });
+      .catch((e) => {
+        console.error(e);
+        if (isBatch) setBatchDone((prev) => prev + 1);
+        setPrintQ(rest);
+      });
   }, [printQ]);
 
-  if (!loaded || !tests) return <div style={{ padding: 40, textAlign: "center", fontFamily: "'Inter', sans-serif", color: C.muted }}>Loading Enterprise LIMS…</div>;
-  if (!hospital.setupDone) return <WelcomePage hospital={hospital} onSave={h => { const v = { ...h, setupDone: true }; sh(v); }}/>;
+  if (!loaded || !tests) return <div style={{ padding: 40, textAlign: "center", fontFamily: "'Inter', sans-serif", color: C.muted }}>Loading Enterprise LIMS Database…</div>;
+  if (!hospital.setupDone) return <WelcomePage hospital={hospital} onSave={(h) => { const v = { ...h, setupDone: true }; sh(v); }}/>;
   if (!currentUser) return <LoginPage accounts={accounts} onLogin={setCurrentUser} hospital={hospital}/>;
 
   const isAdmin = currentUser?.role === "Admin";
@@ -179,79 +367,93 @@ function AppMain({ licData }) {
   ];
 
   return (
-    <div style={{ fontFamily: "'Inter', system-ui, -apple-system, sans-serif", fontSize: 13, background: C.bg, minHeight: "100vh", display: "flex", flexDirection: "column", color: C.text }}>
+    <div style={{ fontFamily: "'Inter', system-ui, -apple-system, sans-serif", fontSize: 13, background: C.bg, height: "100vh", display: "flex", flexDirection: "column", color: C.text, overflow: "hidden" }}>
+      <style>{`
+        input, select, textarea {
+          -webkit-user-select: text !important;
+          user-select: text !important;
+          pointer-events: auto !important;
+        }
+      `}</style>
       
-      {/* Top Enterprise Header */}
-      <header style={{ background: C.primary, color: "#fff", padding: "0 24px", height: 60, display: "flex", alignItems: "center", justifyContent: "space-between", boxShadow: "0 2px 8px rgba(15,45,82,0.15)", zIndex: 10 }}>
-        
-        {/* Brand */}
+      {/* ── 1. TOP HEADER BAR WITH CUSTOM B-CROSS LOGO ── */}
+      <header style={{ background: "#0d213a", color: "#fff", padding: "0 20px", height: 56, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0, boxShadow: "0 2px 8px rgba(0,0,0,0.2)", zIndex: 20 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <div style={{ width: 34, height: 34, borderRadius: 8, background: "rgba(255,255,255,0.12)", display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid rgba(255,255,255,0.2)" }}>
-            <Icon name="hospital" size={18} color="#fff" />
+          <div style={{ width: 36, height: 36, borderRadius: 8, background: "#ffffff", display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid rgba(255,255,255,0.3)", padding: 2, overflow: "hidden" }}>
+            <img src={hospital.logoUri || "/icons/icon.png"} alt="Logo" style={{ width: "100%", height: "100%", objectFit: "contain" }} onError={(e) => { e.target.style.display = "none"; }} />
           </div>
           <div>
-            <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "-.01em", color: "#fff" }}>{hospital.name || "Enterprise LIMS"}</div>
-            <div style={{ fontSize: 10.5, color: "rgba(255,255,255,0.6)", letterSpacing: ".04em", textTransform: "uppercase" }}>Clinical Information System</div>
+            <div style={{ fontWeight: 800, fontSize: 14, letterSpacing: "0.02em", color: "#fff", lineHeight: 1.2 }}>
+              {hospital.name || "BAIS DISTRICT HOSPITAL"}
+            </div>
+            <div style={{ fontSize: 9.5, color: "#94a3b8", letterSpacing: "0.06em", textTransform: "uppercase", fontWeight: 600, marginTop: 1 }}>
+              CLINICAL INFORMATION SYSTEM
+            </div>
           </div>
         </div>
 
-        {/* User Info & Actions */}
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
           <HeaderClock />
-          <div style={{ width: 1, height: 28, background: "rgba(255,255,255,0.15)" }} />
+          <div style={{ width: 1, height: 26, background: "rgba(255,255,255,0.15)" }} />
           
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div style={{ width: 36, height: 36, borderRadius: "50%", background: C.accent, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 700, fontSize: 13, boxShadow: "0 2px 6px rgba(37,99,235,0.3)" }}>
-              {currentUser.name ? currentUser.name.slice(0, 2).toUpperCase() : "US"}
+            <div style={{ width: 34, height: 34, borderRadius: "50%", background: "#2563eb", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 700, fontSize: 12 }}>
+              {(currentUser.name || currentUser.username || "AD").slice(0, 2).toUpperCase()}
             </div>
             <div style={{ display: "flex", flexDirection: "column" }}>
-              <span style={{ fontWeight: 600, fontSize: 13, color: "#fff", lineHeight: 1.2 }}>{currentUser.name}</span>
-              <span style={{ fontSize: 10.5, color: "#93c5fd", fontWeight: 500, marginTop: 2 }}>{currentUser.role}</span>
+              <span style={{ fontWeight: 700, fontSize: 13, color: "#fff", lineHeight: 1.1 }}>{currentUser.name || "Administrator"}</span>
+              <span style={{ fontSize: 11, color: "#93c5fd", fontWeight: 500, marginTop: 2 }}>{currentUser.role || "Admin"}</span>
             </div>
           </div>
 
-          <div style={{ display: "flex", gap: 6, marginLeft: 8 }}>
-            <button onClick={() => setSwitchModal(true)} style={{ background: "rgba(255,255,255,0.1)", color: "#fff", border: "1px solid rgba(255,255,255,0.2)", borderRadius: 6, padding: "6px 10px", cursor: "pointer", fontSize: 11.5, fontWeight: 600, display: "flex", alignItems: "center", gap: 5 }}>
+          <div style={{ display: "flex", gap: 8, marginLeft: 6 }}>
+            <button onClick={() => setSwitchModal(true)} style={{ background: "rgba(255,255,255,0.12)", color: "#fff", border: "1px solid rgba(255,255,255,0.2)", borderRadius: 6, padding: "5px 12px", cursor: "pointer", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
               <Icon name="switch" size={14} color="#fff" /> Switch
             </button>
-            <button onClick={() => setCurrentUser(null)} style={{ background: "rgba(239,68,68,0.2)", color: "#fca5a5", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 6, padding: "6px 10px", cursor: "pointer", fontSize: 11.5, fontWeight: 600, display: "flex", alignItems: "center", gap: 5 }}>
-              <Icon name="logout" size={14} color="#fca5a5" /> Exit
+            <button onClick={() => setCurrentUser(null)} style={{ background: "#dc2626", color: "#fff", border: "none", borderRadius: 6, padding: "5px 12px", cursor: "pointer", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+              <Icon name="logout" size={14} color="#fff" /> Exit
             </button>
           </div>
         </div>
       </header>
 
-      {/* Main Body */}
+      {/* ── 2. SIDEBAR & MAIN BODY ── */}
       <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
         
-        {/* Navigation Sidebar */}
-        <aside style={{ width: 220, background: C.sidebarBg, display: "flex", flexDirection: "column", padding: "16px 12px", borderRight: "1px solid rgba(255,255,255,0.06)", flexShrink: 0 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,0.4)", textTransform: "uppercase", letterSpacing: ".08em", padding: "0 10px 10px 10px" }}>Core Modules</div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 4, flex: 1 }}>
-            {navItems.map(n => {
-              const active = view === n.id;
+        {/* Sidebar */}
+        <aside style={{ width: 220, background: "#0b1d33", display: "flex", flexDirection: "column", padding: "16px 12px", borderRight: "1px solid rgba(255,255,255,0.06)", flexShrink: 0 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.08em", padding: "0 10px 12px 10px" }}>
+            CORE MODULES
+          </div>
+          
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, flex: 1, overflowY: "auto" }}>
+            {navItems.map((n) => {
+              const active = view === n.id || (n.id === "dashboard" && curSection !== null);
               return (
                 <button
                   key={n.id}
-                  onClick={() => setView(n.id)}
+                  onClick={() => {
+                    if (n.id === "dashboard") setPreDraft(null);
+                    changeView(n.id);
+                  }}
                   style={{
                     width: "100%",
-                    background: active ? C.accent : "transparent",
+                    background: active ? "#2563eb" : "transparent",
                     border: "none",
                     borderRadius: 8,
-                    color: active ? "#fff" : "rgba(255,255,255,0.7)",
-                    padding: "9px 12px",
+                    color: active ? "#ffffff" : "#94a3b8",
+                    padding: "10px 14px",
                     cursor: "pointer",
                     textAlign: "left",
                     display: "flex",
                     alignItems: "center",
                     gap: 12,
                     fontSize: 13,
-                    fontWeight: active ? 600 : 500,
+                    fontWeight: active ? 700 : 500,
                     transition: "all .15s ease-in-out"
                   }}
                 >
-                  <Icon name={n.icon} size={18} color={active ? "#fff" : "rgba(255,255,255,0.6)"} />
+                  <Icon name={n.icon} size={18} color={active ? "#ffffff" : "#94a3b8"} />
                   <span>{n.label}</span>
                 </button>
               );
@@ -259,11 +461,41 @@ function AppMain({ licData }) {
           </div>
         </aside>
 
-        {/* Content Area */}
+        {/* Content View Area */}
         <main style={{ flex: 1, padding: 24, overflowY: "auto", background: C.bg }}>
-          {view === "dashboard" && <DashboardView results={results} patients={patients} sections={SECTIONS} onNav={setView} onPrint={r => setPrintQ(q => [...q, r])}/>}
-          {curSection && <LabEntry key={curSection} section={curSection} secDef={secDef} tests={tests} patients={patients} staff={staff} results={results} hospital={hospital} onSave={addResult} onPrint={r => setPrintQ(q => [...q, r])} onSwitchSection={(v, pId) => { if (pId) setCrossSectionPatientId(pId); setView(v); }} preSelectedTests={barcodeNav?.section === curSection ? barcodeNav.testIds : null} prePatientId={barcodeNav?.section === curSection ? barcodeNav.patientId : crossSectionPatientId}/>}
-          {view === "reports" && <ReportsView results={results} patients={patients} staff={staff} onPrint={r => setPrintQ(q => [...q, r])} onBatchPrint={q => setPrintQ(q)} onDelete={delResult} onEdit={editResult}/>}
+          {view === "dashboard" && (
+            <DashboardView
+              results={results}
+              patients={patients}
+              drafts={drafts}
+              sections={SECTIONS}
+              onNav={(v) => { setPreDraft(null); changeView(v); }}
+              onPrint={handleTriggerPrint}
+              onBatchPrint={(q) => { const batchQ = [...q]; batchQ._batch = true; setPrintQ(batchQ); }}
+              onResumeDraft={handleResumeDraft}
+            />
+          )}
+          {curSection && (
+            <LabEntry
+              key={curSection + (preDraft?.id || "")}
+              section={curSection}
+              secDef={secDef}
+              tests={tests}
+              patients={patients}
+              staff={staff}
+              results={results}
+              hospital={hospital}
+              onSave={addResult}
+              onPrint={handleTriggerPrint}
+              onSwitchSection={(v, pId) => { if (pId) setCrossSectionPatientId(pId); setPreDraft(null); changeView(v); }}
+              preSelectedTests={barcodeNav?.section === curSection ? barcodeNav.testIds : null}
+              prePatientId={barcodeNav?.section === curSection ? barcodeNav.patientId : crossSectionPatientId}
+              preDraft={preDraft}
+              onSaveDraft={handleSaveDraft}
+              onDeleteDraft={handleDeleteDraft}
+            />
+          )}
+          {view === "reports" && <ReportsView results={results} patients={patients} staff={staff} onPrint={handleTriggerPrint} onBatchPrint={(q) => { const batchQ = [...q]; batchQ._batch = true; setPrintQ(batchQ); }} onDelete={delResult} onEdit={editResult}/>}
           {view === "patients" && <PatientsView data={patients} onSave={sp}/>}
           {view === "personnel" && <PersonnelView data={staff} onSave={ss}/>}
           {view === "parameters" && <ParametersView tests={tests} onSave={st}/>}
@@ -271,11 +503,71 @@ function AppMain({ licData }) {
           {view === "summary" && <SummaryView results={results} patients={patients} hospital={hospital}/>}
           {view === "hospitalinfo" && <HospitalView data={hospital} onSave={sh}/>}
           {view === "accounts" && <AccountsView accounts={accounts} onSave={sa}/>}
-          {view === "barcode" && <BarcodeView patients={patients} tests={tests} sections={SECTIONS} onNav={(v, bNav) => { if (bNav) setBarcodeNav(bNav); setView(v); }}/>}
+          {view === "barcode" && <BarcodeView patients={patients} tests={tests} sections={SECTIONS} onNav={(v, bNav) => { if (bNav) setBarcodeNav(bNav); changeView(v); }}/>}
         </main>
       </div>
 
-      {switchModal && <SwitchProfileModal accounts={accounts} currentUser={currentUser} onSwitch={u => { setCurrentUser(u); setSwitchModal(false); }} onClose={() => setSwitchModal(false)}/>}
+      {switchModal && <SwitchProfileModal accounts={accounts} currentUser={currentUser} onSwitch={(u) => { setCurrentUser(u); setSwitchModal(false); }} onClose={() => setSwitchModal(false)}/>}
+
+      {previewPdfObj && (
+        <PDFPreviewModal
+          pdfDataUri={previewPdfObj.dataUri}
+          filename={previewPdfObj.filename}
+          onPrint={handleConfirmPrintFromPreview}
+          onClose={() => setPreviewPdfObj(null)}
+        />
+      )}
+
+      {/* Batch Print Progress Overlay */}
+      {batchActive && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 9999, background: "rgba(15,45,74,.85)", display: "flex", alignItems: "center", justifyContent: "center", backdropFilter: "blur(4px)" }}>
+          <div style={{ background: "#fff", borderRadius: 16, padding: "36px 44px", textAlign: "center", boxShadow: "0 20px 60px rgba(0,0,0,.4)", minWidth: 360, maxWidth: 440, position: "relative" }}>
+            
+            <button
+              onClick={closeBatchOverlay}
+              style={{ position: "absolute", top: 12, right: 12, background: "transparent", border: "none", fontSize: 18, color: C.muted, cursor: "pointer", width: 28, height: 28, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center" }}
+              title="Close overlay"
+            >
+              ✕
+            </button>
+
+            <div style={{ width: 64, height: 64, borderRadius: "50%", margin: "0 auto 20px", background: batchDone >= batchTotal ? "#dcfce7" : "#e8f4fb", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28, border: batchDone >= batchTotal ? "3px solid #86efac" : `3px solid ${C.accentMid}` }}>
+              {batchDone >= batchTotal ? "✅" : "🖨"}
+            </div>
+            
+            <div style={{ fontWeight: 700, fontSize: 18, color: C.primary, marginBottom: 6 }}>
+              {batchDone >= batchTotal ? "Batch Print Complete!" : "Printing Results…"}
+            </div>
+            
+            <div style={{ fontSize: 36, fontWeight: 800, color: batchDone >= batchTotal ? C.success : C.accent, letterSpacing: "-0.02em", margin: "8px 0" }}>
+              {batchDone} / {batchTotal}
+            </div>
+            
+            <div style={{ background: "#e2e8f0", borderRadius: 6, height: 8, overflow: "hidden", marginBottom: 14 }}>
+              <div style={{ height: "100%", borderRadius: 6, transition: "width .4s ease", background: batchDone >= batchTotal ? "#22c55e" : `linear-gradient(90deg, ${C.accent}, ${C.accentMid})`, width: `${batchTotal > 0 ? Math.round((batchDone / batchTotal) * 100) : 0}%` }} />
+            </div>
+            
+            {batchDone < batchTotal && batchCurrentName && (
+              <div style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>
+                Now printing: <strong style={{ color: C.text }}>{batchCurrentName}</strong>
+              </div>
+            )}
+            
+            <div style={{ fontSize: 11, color: C.faint, marginBottom: batchDone >= batchTotal ? 16 : 0 }}>
+              {batchDone >= batchTotal ? "All results have been sent to the printer." : "Please wait — do not close the application."}
+            </div>
+
+            {batchDone >= batchTotal && (
+              <button
+                onClick={closeBatchOverlay}
+                style={Btn("accent", { height: 36, padding: "0 24px", fontSize: 13, width: "100%", justifyContent: "center" })}
+              >
+                ✓ Close Window
+              </button>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -288,10 +580,10 @@ function HeaderClock() {
   }, []);
   return (
     <div style={{ textAlign: "right" }}>
-      <div style={{ fontSize: 13, fontWeight: 600, fontVariantNumeric: "tabular-nums", letterSpacing: ".02em", color: "#fff" }}>
+      <div style={{ fontSize: 13, fontWeight: 700, fontVariantNumeric: "tabular-nums", letterSpacing: ".02em", color: "#fff", lineHeight: 1.1 }}>
         {time.toLocaleTimeString("en-US", { hour12: false })}
       </div>
-      <div style={{ fontSize: 10, color: "rgba(255,255,255,0.6)", marginTop: 1 }}>
+      <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 2, fontWeight: 500 }}>
         {time.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}
       </div>
     </div>

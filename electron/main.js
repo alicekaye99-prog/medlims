@@ -16,6 +16,10 @@ if (isWin7) {
   app.commandLine.appendSwitch('disable-software-rasterizer');
 }
 
+const iconPath = process.platform === 'win32'
+  ? path.join(__dirname, '../icons/icon.ico')
+  : path.join(__dirname, '../icons/icon.png');
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -23,7 +27,7 @@ function createWindow() {
     minWidth: 900,
     minHeight: 600,
     title: 'MedLIMS',
-    icon: path.join(__dirname, '../icons/icon.ico'),
+    icon: iconPath,
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -40,18 +44,15 @@ function createWindow() {
     mainWindow.show();
   });
 
-  // ── Block DevTools in production builds ──
+  // Block DevTools in production builds
   if (app.isPackaged) {
-    // Block F12, Ctrl+Shift+I, Ctrl+Shift+J, Ctrl+U
     mainWindow.webContents.on('before-input-event', (event, input) => {
       if (input.key === 'F12') { event.preventDefault(); return; }
       if (input.control && input.shift && input.key.toLowerCase() === 'i') { event.preventDefault(); return; }
       if (input.control && input.shift && input.key.toLowerCase() === 'j') { event.preventDefault(); return; }
       if (input.control && input.key.toLowerCase() === 'u') { event.preventDefault(); return; }
     });
-    // Block right-click Inspect Element
     mainWindow.webContents.on('context-menu', (event) => { event.preventDefault(); });
-    // Force-close DevTools if somehow opened
     mainWindow.webContents.on('devtools-opened', () => { mainWindow.webContents.closeDevTools(); });
   }
 
@@ -65,10 +66,9 @@ function createWindow() {
   });
 }
 
-// Get PDF save folder — use custom path if set, otherwise default
+// Get PDF save folder
 const CUSTOM_PATH_FILE = path.join(app.getPath('userData'), 'pdf_save_path.txt');
 function getPDFFolder() {
-  // Check for custom path
   try {
     if (fs.existsSync(CUSTOM_PATH_FILE)) {
       const custom = fs.readFileSync(CUSTOM_PATH_FILE, 'utf8').trim();
@@ -84,7 +84,6 @@ function getPDFFolder() {
 
 ipcMain.handle('get-pdf-folder', () => getPDFFolder());
 
-// Set custom PDF save folder
 ipcMain.handle('set-pdf-folder', async (event, folderPath) => {
   try {
     if (folderPath) {
@@ -92,7 +91,6 @@ ipcMain.handle('set-pdf-folder', async (event, folderPath) => {
       fs.writeFileSync(CUSTOM_PATH_FILE, folderPath, 'utf8');
       return { success: true, path: folderPath };
     } else {
-      // Reset to default
       if (fs.existsSync(CUSTOM_PATH_FILE)) fs.unlinkSync(CUSTOM_PATH_FILE);
       return { success: true, path: getPDFFolder() };
     }
@@ -101,7 +99,6 @@ ipcMain.handle('set-pdf-folder', async (event, folderPath) => {
   }
 });
 
-// Open folder picker dialog
 ipcMain.handle('pick-folder', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory'],
@@ -111,12 +108,11 @@ ipcMain.handle('pick-folder', async () => {
   return { canceled: false, path: result.filePaths[0] };
 });
 
-// Open folder in file explorer
 ipcMain.handle('open-folder', (event, folderPath) => {
   shell.openPath(folderPath || getPDFFolder());
 });
 
-// ── Printer Management ──
+// Printer Management
 const PRINTER_PREFS_FILE = path.join(app.getPath('userData'), 'printer_prefs.json');
 function loadPrinterPrefs() {
   try {
@@ -128,7 +124,6 @@ function savePrinterPrefs(prefs) {
   try { fs.writeFileSync(PRINTER_PREFS_FILE, JSON.stringify(prefs), 'utf8'); } catch(e) {}
 }
 
-// Get list of all printers
 ipcMain.handle('get-printers', async () => {
   try {
     const printers = mainWindow.webContents.getPrinters();
@@ -143,16 +138,13 @@ ipcMain.handle('get-printers', async () => {
   }
 });
 
-// Get saved printer preferences
 ipcMain.handle('get-printer-prefs', () => loadPrinterPrefs());
 
-// Save printer preferences
 ipcMain.handle('set-printer-prefs', (event, prefs) => {
   savePrinterPrefs(prefs);
   return { success: true };
 });
 
-// Print label HTML to a specific printer (for barcode/thermal labels)
 ipcMain.handle('print-label', (event, htmlContent, printerName) => {
   return new Promise((resolve) => {
     try {
@@ -169,7 +161,6 @@ ipcMain.handle('print-label', (event, htmlContent, printerName) => {
         backgroundColor: '#ffffff',
       });
 
-      // Position off-screen-ish
       labelWin.setPosition(-2000, 0);
 
       const tempPath = path.join(app.getPath('temp'), 'medlims_label_' + Date.now() + '.html');
@@ -218,7 +209,6 @@ ipcMain.handle('save-pdf', (event, filename, base64data) => {
   }
 });
 
-// Open PDF in the built-in viewer (single result print)
 ipcMain.handle('print-pdf', (event, filePath, filename) => {
   try {
     if (pdfWindow && !pdfWindow.isDestroyed()) {
@@ -231,7 +221,7 @@ ipcMain.handle('print-pdf', (event, filePath, filename) => {
       minWidth: 600,
       minHeight: 500,
       title: 'MedLIMS — PDF Viewer',
-      icon: path.join(__dirname, '../icons/icon.ico'),
+      icon: iconPath,
       parent: mainWindow,
       webPreferences: {
         nodeIntegration: false,
@@ -258,7 +248,6 @@ ipcMain.handle('print-pdf', (event, filePath, filename) => {
   }
 });
 
-// Silent print — uses OS-level print, optionally to a specific printer
 ipcMain.handle('silent-print-pdf', (event, filePath, printerName) => {
   return new Promise((resolve) => {
     try {
@@ -266,7 +255,6 @@ ipcMain.handle('silent-print-pdf', (event, filePath, printerName) => {
         const prefs = loadPrinterPrefs();
         const targetPrinter = printerName || prefs.resultPrinter || '';
         
-        // Try Adobe Reader / Foxit with specific printer
         const tryPaths = [
           'C:\\Program Files (x86)\\Adobe\\Acrobat Reader DC\\Reader\\AcroRd32.exe',
           'C:\\Program Files\\Adobe\\Acrobat Reader DC\\Reader\\AcroRd32.exe',
@@ -278,7 +266,6 @@ ipcMain.handle('silent-print-pdf', (event, filePath, printerName) => {
         for (const readerPath of tryPaths) {
           if (fs.existsSync(readerPath)) {
             found = true;
-            // /t file printer = print to specific printer
             const args = targetPrinter
               ? ['/t', filePath, targetPrinter]
               : ['/t', filePath];

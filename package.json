@@ -13,7 +13,6 @@
   "author": "Bryce Men Kenk C. Ablir, RMT",
   "license": "ISC",
   "dependencies": {
-    "better-sqlite3": "^13.0.2",
     "dexie": "^4.4.4",
     "jspdf": "^2.5.1",
     "jspdf-autotable": "^3.8.2",
